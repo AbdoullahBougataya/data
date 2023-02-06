@@ -19,6 +19,7 @@ import torch.multiprocessing as mp
 
 from torch.utils.data import DataLoader
 from torch.utils.data.datapipes.iter.grouping import SHARDING_PRIORITIES
+from torch.utils.data.datapipes.utils.snapshot import _simple_graph_snapshot_restoration
 
 from torchdata._constants import default_dl2_worker_join_timeout_in_s, default_timeout_in_s
 from torchdata.dataloader2 import communication
@@ -209,6 +210,7 @@ class PrototypeMultiProcessingReadingService(ReadingServiceInterface):
         self._pg = None
         self._world_size = 1
         self._rank = 0
+        self._initial_seed = None
 
     def initialize(self, datapipe: DataPipe) -> DataPipe:
         r"""
@@ -316,11 +318,17 @@ class PrototypeMultiProcessingReadingService(ReadingServiceInterface):
         if self._pg is not None:
             shared_seed_int = dist_share_seed(seed_generator.generate_shared_seed(), self._pg)
             seed_generator.seed(shared_seed_int)
+            # TODO: What happens when `self._pg` is `None`? What is the shared seed?
+            self._initial_seed = shared_seed_int
             seed_generator = seed_generator.spawn(self._rank, inplace=True)
 
         assert self._end_datapipe is not None
 
         set_graph_random_seed(self._end_datapipe, seed_generator)
+
+        assert self.end_datapipe is not None
+
+        set_graph_random_seed(self.end_datapipe, seed_generator)
 
         if self._mp:
             if self.main_prefetch_cnt > 0:
@@ -432,6 +440,15 @@ class PrototypeMultiProcessingReadingService(ReadingServiceInterface):
             )
         if self.main_prefetch_cnt > 0 and self.num_workers > 0:
             self._end_datapipe.resume()  # type: ignore[union-attr]
+
+    def _get_naive_datapipe_snapshot(self):
+        return self.end_datapipe._number_of_samples_yielded, self._initial_seed
+
+    def _restore_naive_datapipe_snapshot(self, n_samples_yielded, initial_seed):
+        initial_seed_generator = torch.Generator()
+        initial_seed_generator.manual_seed(initial_seed)
+        _simple_graph_snapshot_restoration(self.end_datapipe, n_samples_yielded, initial_seed_generator)
+        # TODO: I might want to skip `initialize_iteration` after this????
 
 
 class MultiProcessingReadingService(ReadingServiceInterface):

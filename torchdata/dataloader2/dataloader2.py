@@ -21,7 +21,11 @@ from torchdata.dataloader2.graph._serialization import (
 )
 from torchdata.dataloader2.random import SeedGenerator
 from torchdata.dataloader2.random.seed_generator import _UINT64_UPPER_BOUND
-from torchdata.dataloader2.reading_service import CheckpointableReadingServiceInterface, ReadingServiceInterface
+from torchdata.dataloader2.reading_service import (
+    CheckpointableReadingServiceInterface,
+    PrototypeMultiProcessingReadingService,
+    ReadingServiceInterface,
+)
 
 T_co = TypeVar("T_co", covariant=True)
 SERIALIZED_DATAPIPE_KEY_NAME = "serialized_datapipe"
@@ -217,6 +221,7 @@ class DataLoader2(Generic[T_co]):
 
             if not self._adapted and self.reading_service is not None:
                 if self.reading_service_state is None:
+                    # Only called once when `self._adapted = False`
                     self.datapipe = self.reading_service.initialize(self.datapipe)
                 else:
                     if not isinstance(self.reading_service, CheckpointableReadingServiceInterface):
@@ -359,3 +364,29 @@ class DataLoader2(Generic[T_co]):
                 self._is_paused = False
         else:
             warnings.warn("ReadingService doesn't support resume.")
+
+    def _get_naive_datapipe_snapshot(self):
+        """
+        Return a snapshot of the DataPipe
+        """
+        if not isinstance(self.reading_service, PrototypeMultiProcessingReadingService):
+            raise RuntimeError(
+                "Only `PrototypeMultiProcessingReadingService` " "currently supports naive DataPipe snapshotting."
+            )
+        self._pause()
+        n_samples_yielded, _initial_seed = self.reading_service._get_naive_datapipe_snapshot()
+        self._resume()
+        return n_samples_yielded, _initial_seed
+
+    def _restore_naive_datapipe_snapshot(self, n_samples_yielded, initial_seed) -> None:
+        if not isinstance(self.reading_service, PrototypeMultiProcessingReadingService):
+            raise RuntimeError(
+                "Only `PrototypeMultiProcessingReadingService` " "currently supports naive DataPipe snapshotting."
+            )
+        if not self._adapted:
+            self.datapipe = self.reading_service.initialize(self.datapipe)
+            self._adapted = True
+        self.reading_service._restore_naive_datapipe_snapshot(n_samples_yielded, initial_seed)
+        # TODO: I might want to skip `initialize_iteration` after this????
+
+        # TODO: Integrate this with the existing API? Is anyone using these at the moment?
