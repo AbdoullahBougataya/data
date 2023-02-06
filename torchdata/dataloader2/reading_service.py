@@ -73,7 +73,7 @@ class ReadingServiceInterface(ABC):
 
         Args:
             seed_generator: SeedGenerator object created and managed by DataLoader2. As the single
-                source of randomness, it will governs the determinism for all of random operations
+                source of randomness, it will govern the determinism for all of random operations
                 with the graph of DataPipes.
             iter_reset_fn: Optional reset function from the prior ``ReadingServcie``
                 when ``SequentialReadingService`` chains multiple ``ReadingServices``
@@ -396,11 +396,48 @@ class PrototypeMultiProcessingReadingService(ReadingServiceInterface):
             dist.destroy_process_group(self._pg)
             self._pg = None
 
+    def _pause(self):
+        """
+        Pauses DataPipes' activities such as prefetching, in order to collect state.
+        """
+        if self.main_prefetch_cnt > 0 and self.num_workers > 0:
+            # Stop prefetching of main loop first
+            self._end_datapipe.pause()  # type: ignore[union-attr]
+            end_datapipe: DataPipe = self._end_datapipe.source_datapipe  # type: ignore[union-attr]
+        else:
+            end_datapipe = self._end_datapipe  # type: ignore[assignment]
+        if self.num_workers > 0:
+            end_datapipe.request_pause()
+        else:
+            raise RuntimeError(
+                "If you would like to use `pause` with `PrototypeMultiProcessingReadingService`, "
+                "please use more than 0 worker."
+            )
+
+    def _resume(self):
+        """
+        Resumes DataPipes' activities. This is required to be called after `_pause` before
+        the DataLoader can keep yielding elements.
+        """
+        if self.main_prefetch_cnt > 0:
+            end_datapipe: DataPipe = self._end_datapipe.source_datapipe  # type: ignore[union-attr]
+        else:
+            end_datapipe = self._end_datapipe  # type: ignore[assignment]
+        if self.num_workers > 0:
+            end_datapipe.request_resume()
+        else:
+            raise RuntimeError(
+                "If you would like to use `resume` with `PrototypeMultiProcessingReadingService`, "
+                "please use more than 0 worker."
+            )
+        if self.main_prefetch_cnt > 0 and self.num_workers > 0:
+            self._end_datapipe.resume()  # type: ignore[union-attr]
+
 
 class MultiProcessingReadingService(ReadingServiceInterface):
     r"""
     ``MultiProcessingReadingService`` that utilizes ``torch.utils.data.DataLoader`` to
-    launch subprocesses for ``DataPipe`` graph. Please refers to documents of ``DataLoader``
+    launch subprocesses for ``DataPipe`` graph. Please refer to documents of ``DataLoader``
     in https://pytorch.org/docs/stable/data.html#torch.utils.data.DataLoader for all arguments.
 
     Note:
@@ -480,7 +517,7 @@ class DistributedReadingService(ReadingServiceInterface):
     def initialize(self, datapipe: DataPipe) -> DataPipe:
         r"""
         Launches the ``gloo``-backend distributed process group. Carries out distributed sharding
-        on the graph of ``DataPipe`` and returnes the graph attached with a ``FullSyncIterDataPipe``
+        on the graph of ``DataPipe`` and returns the graph attached with a ``FullSyncIterDataPipe``
         at the end.
         """
         if not (dist.is_available() and dist.is_initialized()):

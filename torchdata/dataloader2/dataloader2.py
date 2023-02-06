@@ -5,6 +5,8 @@
 # LICENSE file in the root directory of this source tree.
 
 
+import warnings
+
 from dataclasses import dataclass
 from typing import Any, Dict, Generic, Iterable, Iterator, Optional, TypeVar, Union
 
@@ -46,12 +48,20 @@ class DataLoader2Iterator(Iterator[T_co]):
     def __init__(self, dataloader: "DataLoader2", iterator_id: int):
         self.dataloader = dataloader
         self.iterator_id = iterator_id
+        self.limit_counter: Optional[int] = None
+        self.limit_threshold: Optional[int] = None
 
     def __next__(self) -> T_co:
         if self.iterator_id == self.dataloader.valid_iterator_id:
             self.dataloader._reset_iter = True
             try:
-                return next(self.dataloader._datapipe_iter)  # type: ignore[arg-type]
+                if self.dataloader._is_paused:
+                    raise StopIteration("DataLoader2 has been paused. `resume` must be called before continuing.")
+                else:
+                    next_val = next(self.dataloader._datapipe_iter)  # type: ignore[arg-type]
+                    if self.limit_threshold is not None:
+                        self.limit_counter = self.limit_counter + 1  # type: ignore[operator]
+                    return next_val
             except PauseIteration:
                 raise StopIteration
             except StopIteration:
@@ -62,7 +72,15 @@ class DataLoader2Iterator(Iterator[T_co]):
                 if self.dataloader:
                     self.dataloader.shutdown()
                 raise
-        else:
+            finally:
+                # Call `pause` if threshold is reached
+                if (
+                    not self.dataloader._is_paused
+                    and self.limit_threshold is not None
+                    and self.limit_counter >= self.limit_threshold  # type: ignore[operator]
+                ):
+                    self._pause()
+        else:  # `iterator_id` is not valid
             if self.dataloader.reading_service is not None:
                 self.dataloader.reading_service.finalize_iteration()
             raise RuntimeError(
@@ -72,6 +90,46 @@ class DataLoader2Iterator(Iterator[T_co]):
                 "For feedback regarding this single iterator per DataLoader2 constraint, feel free "
                 "to comment on this issue: https://github.com/pytorch/data/issues/45."
             )
+
+    def _pause(self) -> None:
+        r"""
+        Pauses ``DataLoader2`` by halting its threads and ensure that its state remains unchanged,
+        allowing ``DataLoader2`` to safely perform snapshotting and similar operations afterwards.
+
+        The ``limit_counter`` is also reset to ``0``.
+        """
+        self.dataloader._pause()
+        self.limit_counter = 0
+
+    def resume(self) -> None:
+        r"""
+        Restarts the threads within ``DataLoader2`` and allows it to yield additional batches.
+        """
+        self.dataloader._resume()
+
+    def limit(self, n_batches) -> None:
+        """
+        Pauses ``DataLoader2`` from yielding additional batches after ``n_batches`` has been yielded. The count
+        begins after this method is invoked (i.e. previously yielded batches do not count towards the threshold).
+
+        While paused, ``DataLoader2``'s threads are halted and its state remains unchanged,
+        allowing ``DataLoader2`` to safely perform snapshotting and similar operations.
+        After ``DataLoader2`` is paused, ``resume()`` must be called before it can start yielding again.
+
+        Note:
+            ``limit_threshold`` persists after ``pause`` and ``resume``. Use ``.clear_limit()`` to remove it.
+
+        Args:
+            n_batches: Number of batches after which the DataLoader2 will pause
+        """
+        self.limit_counter = 0
+        self.limit_threshold = n_batches
+
+    def clear_limit(self) -> None:
+        """
+        Set the ``limit_threshold`` to ``None`` such that the iterator will not automatically call ``pause``
+        """
+        self.limit_threshold = None
 
     def __getattr__(self, name):
         """
@@ -114,7 +172,7 @@ class DataLoader2(Generic[T_co]):
         self.datapipe = clone(wrap_datapipe_for_serialization(datapipe)) if datapipe is not None else None
         self._adapted: bool = False
         self._datapipe_iter: Optional[Iterator[T_co]] = None
-        self._reset_iter: bool = True  # Sets to `False` when __iter__ starts, and `True` when `StopIteration``
+        self._reset_iter: bool = True  # Sets to `False` when `__iter__` runs, and `True` when `__next__` is called
         # TODO(630): Some ReadingServices might want to validate adapters, we can add this feature
         if datapipe_adapter_fn is None:
             self.datapipe_adapter_fns = None
@@ -126,6 +184,7 @@ class DataLoader2(Generic[T_co]):
         self.reading_service_state: Optional[bytes] = None  # is not `None` when `load_state_dict` is called
         self._terminated: bool = False
         self.valid_iterator_id: Optional[int] = None
+        self._is_paused = False
 
         if self.datapipe is not None and self.datapipe_adapter_fns is not None:
             for adapter_fn in self.datapipe_adapter_fns:
@@ -283,3 +342,20 @@ class DataLoader2(Generic[T_co]):
             for adapter_fn in self.datapipe_adapter_fns:
                 self.datapipe = adapter_fn(self.datapipe)
         self._datapipe_before_reading_service_adapt = clone(self.datapipe)
+
+    def _pause(self):
+        if hasattr(self.reading_service, "_pause"):
+            self._is_paused = True
+            self.reading_service._pause()
+        else:
+            warnings.warn("ReadingService doesn't support pause.")
+
+    def _resume(self):
+        if hasattr(self.reading_service, "_resume"):
+            if not self._is_paused:
+                warnings.warn("Resume is called when `DataLoader2` is not paused. No operation is performed.")
+            else:
+                self.reading_service._resume()
+                self._is_paused = False
+        else:
+            warnings.warn("ReadingService doesn't support resume.")
